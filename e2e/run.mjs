@@ -211,6 +211,21 @@ try {
     if (Math.abs(res.offsetMs) > 1) throw new Error(`desalinhamento de ${res.offsetMs.toFixed(2)} ms`)
   })
 
+  await step('"Regravar" começa uma nova gravação na mesma tela', async () => {
+    await page.getByRole('button', { name: 'Gravar tela 3' }).click()
+    await page.getByRole('button', { name: 'Parar gravação' }).waitFor()
+    await sleep(5000)
+    await page.getByRole('button', { name: 'Parar gravação' }).click()
+    await page.getByRole('heading', { name: 'Gravação da tela 3' }).waitFor({ timeout: 30000 })
+    await page.getByRole('button', { name: 'Regravar' }).click()
+    await page.getByRole('button', { name: 'Parar gravação' }).waitFor({ timeout: 10000 })
+    await sleep(5000)
+    await page.getByRole('button', { name: 'Parar gravação' }).click()
+    await page.getByRole('heading', { name: 'Gravação da tela 3' }).waitFor({ timeout: 30000 })
+    await page.getByRole('button', { name: 'Descartar' }).click()
+    await page.getByRole('heading', { name: 'Gravação da tela 3' }).waitFor({ state: 'detached' })
+  })
+
   await step('tocar as duas telas juntas', async () => {
     await page.getByRole('button', { name: 'Tocar' }).click()
     await sleep(2500)

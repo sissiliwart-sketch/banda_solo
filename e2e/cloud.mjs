@@ -123,6 +123,7 @@ async function recordAndSave(page, slot, seconds) {
 
 let projectId = null
 let exitCode = 0
+const cleanupExtra = []
 const A = await newPage('A', false)
 const B = await newPage('B', true)
 try {
@@ -217,8 +218,45 @@ try {
     await A.getByRole('button', { name: 'Baixar' }).waitFor({ timeout: 120000 })
     await A.screenshot({ path: `${OUT}cloud-04-exportado.png` })
   })
+  await step('SEGURANÇA: um invasor não consegue falsificar, injetar nem entrar sem código', A, async () => {
+    const proj = await db.getRow({ databaseId: 'bandasolo', tableId: 'projects', rowId: projectId })
+    const cUser = await users.create({ userId: `bse2ec${stamp}`, email: `bs-e2e-c-${stamp}@example.com`, password: `Senha-${stamp}-Cx9`, name: 'Invasor' })
+    const sess = await users.createSession({ userId: cUser.$id })
+    const asC = new Client().setEndpoint(ENDPOINT).setProject(PROJECT).setSession(sess.secret)
+    const cdb = new TablesDB(asC)
+    const forgedCode = `FX${stamp}`.slice(0, 8).toUpperCase().replace(/[^A-Z0-9]/g, 'X')
+    // 1) forged project pointing at A's team, readable by every user
+    const fp = await cdb.createRow({
+      databaseId: 'bandasolo', tableId: 'projects', rowId: `fp${stamp}`,
+      data: { title: 'PROJETO FALSO', slots: 2, aspect: '1:1', ownerId: proj.ownerId, ownerName: 'x', teamId: proj.teamId, shareCode: forgedCode },
+      permissions: ['read("users")', `delete("user:${cUser.$id}")`],
+    })
+    // 2) forged track injected into A's project, readable by every user, newest in slot 0
+    const ft = await cdb.createRow({
+      databaseId: 'bandasolo', tableId: 'tracks', rowId: `ft${stamp}`,
+      data: { projectId, slot: 0, userId: cUser.$id, musicianName: 'INVASOR', status: 'ready', fileIds: [] },
+      permissions: ['read("users")', 'update("users")', 'delete("users")'],
+    })
+    cleanupExtra.push({ table: 'projects', id: fp.$id }, { table: 'tracks', id: ft.$id }, { user: cUser.$id })
+    // 3) join with the forged code
+    const jwt = (await users.createJWT({ userId: cUser.$id, sessionId: sess.$id })).jwt
+    const joinRes = await fetch(`${BASE}/api/join`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: forgedCode, jwt }) })
+    if (joinRes.status === 200) throw new Error('entrou no time com um projeto falso!')
+    const members = await teams.listMemberships({ teamId: proj.teamId, queries: [Query.equal('userId', cUser.$id)] })
+    if (members.total !== 0) throw new Error('invasor virou membro do time!')
+    // A's views must ignore both forgeries
+    await A.goto(`${BASE}/`)
+    await A.getByText(`Nuvem ${stamp}`).waitFor({ timeout: 20000 })
+    if (await A.getByText('PROJETO FALSO').count()) throw new Error('projeto falso apareceu na lista do dono')
+    await A.goto(`${BASE}/p/${projectId}`)
+    await A.getByRole('button', { name: 'Gerar vídeo' }).first().waitFor({ timeout: 20000 })
+    await A.waitForTimeout(1500)
+    if (await A.getByText('INVASOR').count()) throw new Error('faixa injetada apareceu no estúdio')
+    console.log(`   join com código falso: HTTP ${joinRes.status}; lista e estúdio ignoraram as falsificações`)
+  })
+
   await step('dados conferidos no servidor', null, async () => {
-    const tr = await db.listRows({ databaseId: 'bandasolo', tableId: 'tracks', queries: [Query.equal('projectId', projectId)] })
+    const tr = await db.listRows({ databaseId: 'bandasolo', tableId: 'tracks', queries: [Query.equal('projectId', projectId), Query.notEqual('musicianName', 'INVASOR')] })
     const summary = tr.rows.map((r) => ({ slot: r.slot, status: r.status, parts: r.fileIds.length, bytes: Number(r.sizeBytes), by: r.musicianName }))
     console.log('   faixas:', JSON.stringify(summary))
     if (tr.rows.length !== 2 || tr.rows.some((r) => r.status !== 'ready')) throw new Error('faixas incompletas no servidor')
@@ -230,8 +268,12 @@ try {
     console.log(`\nErros no console (${errors.length}):`)
     for (const e of errors.slice(0, 20)) console.log('  ', e)
   }
-  // Cleanup: project rows, files, team and both test users.
+  // Cleanup: forged rows, project rows, files, team and the test users.
   try {
+    for (const x of cleanupExtra) {
+      if (x.user) await users.delete({ userId: x.user }).catch(() => undefined)
+      else await db.deleteRow({ databaseId: 'bandasolo', tableId: x.table, rowId: x.id }).catch(() => undefined)
+    }
     if (projectId) {
       const tr = await db.listRows({ databaseId: 'bandasolo', tableId: 'tracks', queries: [Query.equal('projectId', projectId)] })
       for (const r of tr.rows) {

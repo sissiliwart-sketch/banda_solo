@@ -102,8 +102,8 @@ export class LocalBackend implements Backend {
     throw new BackendError('unsupported', 'Para tocar junto com outra pessoa, entre com uma conta (e-mail e senha).')
   }
 
-  async listTracks(projectId: string): Promise<Track[]> {
-    return this.tracks().filter((t) => t.projectId === projectId)
+  async listTracks(project: Project): Promise<Track[]> {
+    return this.tracks().filter((t) => t.projectId === project.id)
   }
 
   async createTrack(project: Project, id: string, data: NewTrack): Promise<Track> {

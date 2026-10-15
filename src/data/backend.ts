@@ -20,7 +20,8 @@ export interface Backend {
   /** Joins a project shared by someone else using its code. Returns the project. */
   joinByCode(code: string): Promise<Project>
 
-  listTracks(projectId: string): Promise<Track[]>
+  /** Tracks of a project (only rows genuinely shared with its team). */
+  listTracks(project: Project): Promise<Track[]>
   /** Reserves the slot (status "uploading") before the media upload starts. */
   createTrack(project: Project, id: string, data: NewTrack): Promise<Track>
   updateTrack(id: string, patch: Partial<Track>): Promise<Track>

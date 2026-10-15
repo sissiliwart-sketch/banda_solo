@@ -25,7 +25,7 @@ import { dropTrackFile, ensureTrackFile } from '../data/mediaCache'
 import { useApp } from '../data/store'
 import { DEFAULT_MIX, songDuration, type NewTrack, type Project, type ProjectSettings, type Track, type UserInfo } from '../data/types'
 import { loadSelection, permissionErrorMessage, saveSelection, type DeviceSelection } from '../media/devices'
-import { paths, removeEntry, requestPersistence } from '../media/opfs'
+import { clearDir, paths, readFile, removeEntry, requestPersistence } from '../media/opfs'
 import { CalibrationPanel, DevicesSheet } from '../studio/DevicesSheet'
 import { StudioEngine, type TakeResult, type TransportState } from '../studio/engine'
 import { ExportSheet } from '../studio/ExportSheet'
@@ -121,19 +121,32 @@ export default function StudioPage() {
   const downloading = useRef(new Set<string>())
   const pendingMix = useRef(new Map<string, { patch: Partial<Track>; timer: number }>())
   const projectRef = useRef(project)
+  const uploadsRef = useRef(uploads)
   const calibAsked = useRef(false)
+  /** Who occupied the armed slot when the take started (to detect a collaborator saving there meanwhile). */
+  const slotOccupantAtRecord = useRef<string | null>(null)
   useLayoutEffect(() => {
     filesRef.current = files
     tracksRef.current = tracks
     projectRef.current = project
+    uploadsRef.current = uploads
   })
 
   // ------------------------------------------------------------- loading
 
   const reloadTracks = useCallback(async () => {
-    if (!id) return
+    const p = projectRef.current
+    if (!p) return
     try {
-      const list = await backend.listTracks(id)
+      const list = await backend.listTracks(p)
+      // Free device storage for tracks that collaborators deleted or replaced.
+      const alive = new Set(list.map((t) => t.id))
+      for (const t of tracksRef.current) {
+        if (!alive.has(t.id) && uploadsRef.current[t.id] === undefined) {
+          void dropTrackFile(t.id)
+          setFiles((f) => omit(f, t.id))
+        }
+      }
       setTracks((prev) =>
         list.map((t) => {
           const pending = pendingMix.current.get(t.id)
@@ -144,14 +157,14 @@ export default function StudioPage() {
     } catch (err) {
       console.warn(err)
     }
-  }, [backend, id])
+  }, [backend])
 
   useEffect(() => {
     let alive = true
     void (async () => {
       try {
         const p = await backend.getProject(id)
-        const list = await backend.listTracks(id)
+        const list = await backend.listTracks(p)
         if (!alive) return
         setProject(p)
         setTracks(list)
@@ -163,10 +176,30 @@ export default function StudioPage() {
       }
     })()
     void requestPersistence()
+    // Leftovers of takes interrupted by a crash or a closed tab.
+    void clearDir('takes')
     return () => {
       alive = false
     }
   }, [backend, id, nav])
+
+  // Resume my own uploads that were interrupted (closed tab, lost connection) — the take is still
+  // on this device, so the slot doesn't stay stuck as "enviando" forever.
+  const resumeChecked = useRef(false)
+  useEffect(() => {
+    if (!project || !user || resumeChecked.current) return
+    resumeChecked.current = true
+    void (async () => {
+      for (const t of tracksRef.current) {
+        if (t.status !== 'uploading' || t.userId !== user.id || uploadsRef.current[t.id] !== undefined) continue
+        const f = await readFile(paths.track(t.id))
+        if (!f) continue
+        setFiles((fs) => ({ ...fs, [t.id]: f }))
+        void uploadTrack(t, f, tracksRef.current.filter((x) => x.slot === t.slot && x.id !== t.id))
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, user])
 
   useEffect(() => {
     if (!id) return
@@ -345,11 +378,13 @@ export default function StudioPage() {
     await engine.play(seekPos >= duration - 0.25 ? 0 : seekPos)
   }
 
-  async function onRecord(skipCalibration = false) {
+  async function onRecord(opts: { skipCalibration?: boolean; ignoreTake?: boolean; slot?: number } = {}) {
     if (!engine || !project) return
+    const slot = opts.slot ?? armed
+    const skipCalibration = opts.skipCalibration ?? false
     await resumeAudio()
     if (busy) return
-    if (take) {
+    if (take && !opts.ignoreTake) {
       toast.info('Salve ou descarte a gravação anterior primeiro.')
       return
     }
@@ -357,7 +392,7 @@ export default function StudioPage() {
       setSheet('devices')
       return
     }
-    const occupant = bySlot.get(armed)
+    const occupant = bySlot.get(slot)
     if (occupant && occupant.status === 'uploading' && !files[occupant.id]) {
       toast.error('Outra pessoa está gravando nesta tela agora.')
       return
@@ -367,9 +402,10 @@ export default function StudioPage() {
       setAskCalibrate(true)
       return
     }
+    slotOccupantAtRecord.current = occupant?.id ?? null
     try {
       await engine.record({
-        slot: armed,
+        slot,
         bpm: project.bpm,
         beatsPerBar: project.beatsPerBar,
         countInBeats: project.countInBars * project.beatsPerBar,
@@ -395,8 +431,11 @@ export default function StudioPage() {
     setUploads((u) => ({ ...u, [t.id]: 0 }))
     try {
       const fileIds = await backend.uploadTrackMedia(p, t, file, (f) => setUploads((u) => ({ ...u, [t.id]: f })))
-      const ready = await backend.updateTrack(t.id, { fileIds, status: 'ready', ...(pendingMix.current.get(t.id)?.patch ?? {}) })
-      setTracks((prev) => prev.map((x) => (x.id === t.id ? { ...ready, ...(pendingMix.current.get(t.id)?.patch ?? {}) } : x)))
+      const deferred = pendingMix.current.get(t.id)
+      if (deferred?.timer) clearTimeout(deferred.timer)
+      pendingMix.current.delete(t.id)
+      const ready = await backend.updateTrack(t.id, { fileIds, status: 'ready', ...(deferred?.patch ?? {}) })
+      setTracks((prev) => prev.map((x) => (x.id === t.id ? { ...ready, ...(deferred?.patch ?? {}) } : x)))
       for (const r of replaced) {
         await backend.deleteTrack(p, r).catch(() => undefined)
         await dropTrackFile(r.id)
@@ -410,15 +449,31 @@ export default function StudioPage() {
   }
 
   async function saveTake() {
-    if (!take || !project) return
-    const { result, track } = take
-    const replaced = tracks.filter((t) => t.slot === track.slot)
+    if (!take || !project || !user) return
+    const { result } = take
+    let track = take.track
     try {
+      // A collaborator may have saved into this slot while we were recording: never delete their
+      // take by accident — move ours to a free slot (or ask).
+      const fresh = await backend.listTracks(project).catch(() => tracks)
+      const occupantNow = resolveSlots(fresh).get(track.slot)
+      if (occupantNow && occupantNow.id !== slotOccupantAtRecord.current && occupantNow.userId !== user.id) {
+        const used = new Set(fresh.map((t) => t.slot))
+        const free = [...Array(project.slots).keys()].find((i) => !used.has(i))
+        const who = occupantNow.musicianName || 'Outro músico'
+        if (free !== undefined) {
+          toast.info(`${who} gravou a tela ${track.slot + 1} enquanto você gravava. Sua gravação foi para a tela ${free + 1}.`)
+          track = { ...track, slot: free }
+        } else if (!confirm(`${who} acabou de gravar a tela ${track.slot + 1}. Substituir essa gravação pela sua?`)) {
+          return
+        }
+      }
+      const replaced = fresh.filter((t) => t.slot === track.slot && t.id !== track.id)
       const created = await backend.createTrack(project, track.id, toNewTrack(track))
       setFiles((f) => ({ ...f, [track.id]: result.file }))
-      setTracks((prev) => [...prev.filter((x) => x.slot !== track.slot), { ...track, ...created, status: 'uploading' }])
+      setTracks((prev) => [...prev.filter((x) => x.slot !== track.slot && x.id !== track.id), { ...track, ...created, status: 'uploading' }])
       setTake(null)
-      const used = new Set([...tracks.filter((t) => t.slot !== track.slot).map((t) => t.slot), track.slot])
+      const used = new Set([...fresh.filter((t) => t.slot !== track.slot).map((t) => t.slot), track.slot])
       const next = [...Array(project.slots).keys()].map((i) => (track.slot + 1 + i) % project.slots).find((i) => !used.has(i))
       if (next !== undefined) setArmed(next)
       void uploadTrack(created, result.file, replaced)
@@ -437,8 +492,10 @@ export default function StudioPage() {
   async function retake() {
     const slot = take?.track.slot
     await discardTake()
-    if (slot !== undefined) setArmed(slot)
-    setTimeout(() => void onRecord(true), 50)
+    if (slot === undefined) return
+    setArmed(slot)
+    // This render's state still holds the discarded take: tell onRecord to ignore it.
+    await onRecord({ skipCalibration: true, ignoreTake: true, slot })
   }
 
   function changeTrack(trackId: string, patch: Partial<Track>) {
@@ -452,7 +509,7 @@ export default function StudioPage() {
     const merged = { ...(cur?.patch ?? {}), ...patch }
     const timer = window.setTimeout(() => {
       pendingMix.current.delete(trackId)
-      if (uploads[trackId] !== undefined) {
+      if (uploadsRef.current[trackId] !== undefined) {
         // Still uploading: the final update after upload carries the patch.
         pendingMix.current.set(trackId, { patch: merged, timer: 0 })
         return
@@ -470,6 +527,8 @@ export default function StudioPage() {
       await dropTrackFile(t.id)
       setTracks((prev) => prev.filter((x) => x.id !== t.id))
       setFiles((f) => omit(f, t.id))
+      setUploads((u) => omit(u, t.id))
+      pendingMix.current.delete(t.id)
       setArmed(t.slot)
     } catch (err) {
       toast.error(errorMessage(err))
@@ -482,7 +541,10 @@ export default function StudioPage() {
       const p = await backend.updateProject(project.id, { ...s, title: s.title.trim() || project.title })
       setProject(p)
       setSheet(null)
-      if (armed >= p.slots) setArmed(0)
+      if (armed >= p.slots) {
+        const used = new Set(tracks.map((t) => t.slot))
+        setArmed([...Array(p.slots).keys()].find((i) => !used.has(i)) ?? 0)
+      }
     } catch (err) {
       toast.error(errorMessage(err))
     }
@@ -492,7 +554,7 @@ export default function StudioPage() {
     if (busy || take) return
     const t = bySlot.get(slot)
     if (t && uploads[t.id] === 'error' && files[t.id]) {
-      void uploadTrack(t, files[t.id], [])
+      void uploadTrack(t, files[t.id], tracks.filter((x) => x.slot === t.slot && x.id !== t.id))
       return
     }
     setArmed(slot)
@@ -522,11 +584,18 @@ export default function StudioPage() {
   const latency = engine?.latencyInfo()
   const recording = transport === 'recording' || transport === 'countin'
   const usedSlots = [...bySlot.keys()]
+  const isOwner = project.ownerId === user.id
+  // Export uses the files on this device, so sending to the cloud never blocks it; only a take
+  // under review or a track still downloading does.
   const exportBlocked = take
     ? 'Salve ou descarte a última gravação antes de gerar o vídeo.'
-    : Object.keys(uploads).length || Object.keys(downloads).length
-      ? 'Aguarde terminar de enviar/baixar as gravações.'
+    : Object.keys(downloads).length
+      ? 'Aguarde terminar de baixar as gravações.'
       : null
+  const missingSlots = [...bySlot.values()].filter((t) => !files[t.id]).map((t) => t.slot + 1)
+  const exportWarning = missingSlots.length
+    ? `Ainda não estão neste aparelho e ficarão de fora: tela${missingSlots.length > 1 ? 's' : ''} ${missingSlots.join(', ')}.`
+    : null
 
   const renderTile = (slot: number): ReactNode => {
     const t = take && take.track.slot === slot ? take.track : bySlot.get(slot)
@@ -635,7 +704,11 @@ export default function StudioPage() {
         <IconButton label="Gravar com outra pessoa" onClick={() => setSheet('share')} disabled={busy}>
           <IconUsers />
         </IconButton>
-        <IconButton label="Configurações da música" onClick={() => setSheet('settings')} disabled={busy || !!take}>
+        <IconButton
+          label={isOwner ? 'Configurações da música' : 'Só quem criou a música pode mudar as configurações'}
+          onClick={() => setSheet('settings')}
+          disabled={busy || !!take || !isOwner}
+        >
           <IconSettings />
         </IconButton>
         <Button variant="primary" size="sm" onClick={() => setSheet('export')} disabled={busy || duration === 0}>
@@ -811,6 +884,7 @@ export default function StudioPage() {
         project={project}
         tracks={engineTracks}
         blocked={exportBlocked}
+        warning={exportWarning}
       />
       <SettingsSheet key={sheet === 'settings' ? 'open' : 'closed'} open={sheet === 'settings'} onClose={() => setSheet(null)} project={project} minSlots={Math.max(2, ...usedSlots.map((s) => s + 1))} onSave={saveSettings} />
 
@@ -863,7 +937,7 @@ export default function StudioPage() {
             variant="ghost"
             onClick={() => {
               setAskCalibrate(false)
-              void onRecord(true)
+              void onRecord({ skipCalibration: true })
             }}
           >
             Gravar sem calibrar

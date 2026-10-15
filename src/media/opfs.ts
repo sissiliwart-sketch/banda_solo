@@ -60,6 +60,18 @@ export async function removeEntry(path: string): Promise<void> {
   }
 }
 
+/** Deletes everything inside a directory (the directory itself stays). */
+export async function clearDir(path: string): Promise<void> {
+  try {
+    const dir = await dirFor(path.split('/').filter(Boolean), false)
+    const names: string[] = []
+    for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) names.push(name)
+    for (const name of names) await dir.removeEntry(name, { recursive: true }).catch(() => undefined)
+  } catch {
+    /* missing directory is fine */
+  }
+}
+
 export async function moveFile(from: string, to: string): Promise<File> {
   const src = await readFile(from)
   if (!src) throw new Error('arquivo de origem não encontrado')

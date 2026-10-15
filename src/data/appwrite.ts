@@ -84,13 +84,33 @@ function friendly(err: unknown): Error {
     if (/database_not_found|table_not_found|collection_not_found|storage_bucket_not_found/.test(type)) {
       return new BackendError(type, 'A nuvem ainda está sendo configurada. Tente de novo em alguns minutos ou use "Testar sem conta".')
     }
-    if (type === 'general_unauthorized_scope' || type === 'user_unauthorized') return new BackendError(type, 'Sem permissão para isso.')
-    if (err.code === 401) return new BackendError('unauthorized', 'Sua sessão expirou. Entre novamente.')
+    if (err.code === 401 && (type === 'user_unauthorized' || type === 'general_unauthorized_scope' || type === 'user_jwt_invalid' || !type)) {
+      // Guests (expired/revoked session) get "missing scope" errors: send them back to the login.
+      return new BackendError('unauthorized', 'Sua sessão expirou. Entre novamente.')
+    }
+    if (err.code === 401) return new BackendError('forbidden', 'Sem permissão para isso.')
     if (err.code === 404) return new BackendError('not_found', 'Não encontrado (talvez tenha sido apagado).')
     return new BackendError(type || 'error', err.message)
   }
   if (err instanceof TypeError) return new BackendError('network', 'Sem conexão com o servidor. Verifique a internet.')
   return err instanceof Error ? err : new Error(String(err))
+}
+
+/**
+ * A project row is genuine when it was created by its owner for its own team: only the owner can
+ * grant delete to themselves and only a team member can grant read to the team. Rows forged by
+ * other accounts (e.g. readable by "any user") never pass.
+ */
+function isGenuineProject(r: Models.DefaultRow): boolean {
+  const d = r as unknown as { teamId?: string; ownerId?: string; $permissions?: string[] }
+  const perms = d.$permissions ?? []
+  return !!d.teamId && !!d.ownerId && perms.includes(`read("team:${d.teamId}")`) && perms.includes(`delete("user:${d.ownerId}")`)
+}
+
+/** Track rows must be readable by the project's team (only members can grant that). */
+function isProjectTrack(r: Models.DefaultRow, teamId: string): boolean {
+  const perms = (r as unknown as { $permissions?: string[] }).$permissions ?? []
+  return perms.includes(`read("team:${teamId}")`) && !perms.some((p) => p.startsWith('read("any') || p.startsWith('read("users') || p.startsWith('read("guests'))
 }
 
 async function wrap<T>(fn: () => Promise<T>): Promise<T> {
@@ -179,7 +199,8 @@ export class AppwriteBackend implements Backend {
   private async token(): Promise<string> {
     if (this.jwt && this.jwt.exp > Date.now()) return this.jwt.token
     const j = await this.account.createJWT()
-    this.jwt = { token: j.jwt, exp: Date.now() + 10 * 60 * 1000 }
+    // JWTs live 15 min; refresh well before that so long downloads never use an expired one.
+    this.jwt = { token: j.jwt, exp: Date.now() + 5 * 60 * 1000 }
     return j.jwt
   }
 
@@ -187,8 +208,16 @@ export class AppwriteBackend implements Backend {
 
   listProjects(): Promise<Project[]> {
     return wrap(async () => {
-      const res = await this.db.listRows({ databaseId: DB_ID, tableId: T_PROJECTS, queries: [Query.orderDesc('$updatedAt'), Query.limit(100)] })
-      return res.rows.map(toProject)
+      // Only projects of teams I belong to, and only genuine rows (no spam from other accounts).
+      const myTeams = await this.teams.list({ queries: [Query.limit(100)] })
+      const teamIds = myTeams.teams.map((t) => t.$id)
+      if (teamIds.length === 0) return []
+      const res = await this.db.listRows({
+        databaseId: DB_ID,
+        tableId: T_PROJECTS,
+        queries: [Query.equal('teamId', teamIds), Query.orderDesc('$updatedAt'), Query.limit(100)],
+      })
+      return res.rows.filter(isGenuineProject).map(toProject)
     })
   }
 
@@ -205,7 +234,8 @@ export class AppwriteBackend implements Backend {
               tableId: T_PROJECTS,
               rowId: uid(),
               data: { ...pick(s, PROJECT_FIELDS), ownerId: me.id, ownerName: me.name, teamId, shareCode: shareCode() },
-              permissions: [Permission.read(Role.team(teamId)), Permission.update(Role.team(teamId)), Permission.delete(Role.user(me.id))],
+              // Members can read; only the owner can change settings/permissions or delete.
+              permissions: [Permission.read(Role.team(teamId)), Permission.update(Role.user(me.id)), Permission.delete(Role.user(me.id))],
             })
             return toProject(row)
           } catch (err) {
@@ -222,7 +252,11 @@ export class AppwriteBackend implements Backend {
   }
 
   getProject(id: string): Promise<Project> {
-    return wrap(async () => toProject(await this.db.getRow({ databaseId: DB_ID, tableId: T_PROJECTS, rowId: id })))
+    return wrap(async () => {
+      const row = await this.db.getRow({ databaseId: DB_ID, tableId: T_PROJECTS, rowId: id })
+      if (!isGenuineProject(row)) throw new BackendError('not_found', 'Projeto não encontrado.')
+      return toProject(row)
+    })
   }
 
   updateProject(id: string, patch: Partial<ProjectSettings>): Promise<Project> {
@@ -238,7 +272,7 @@ export class AppwriteBackend implements Backend {
 
   deleteProject(project: Project): Promise<void> {
     return wrap(async () => {
-      const tracks = await this.listTracks(project.id)
+      const tracks = await this.listTracks(project)
       for (const t of tracks) await this.deleteTrack(project, t)
       await this.db.deleteRow({ databaseId: DB_ID, tableId: T_PROJECTS, rowId: project.id })
       if (project.teamId) await this.teams.delete({ teamId: project.teamId }).catch(() => undefined)
@@ -274,14 +308,15 @@ export class AppwriteBackend implements Backend {
 
   // ---------------------------------------------------------------- tracks
 
-  listTracks(projectId: string): Promise<Track[]> {
+  listTracks(project: Project): Promise<Track[]> {
     return wrap(async () => {
       const res = await this.db.listRows({
         databaseId: DB_ID,
         tableId: T_TRACKS,
-        queries: [Query.equal('projectId', projectId), Query.limit(50)],
+        queries: [Query.equal('projectId', project.id), Query.limit(50)],
       })
-      return res.rows.map(toTrack)
+      // Ignore rows not shared with this project's team (forged by an outsider).
+      return res.rows.filter((r) => isProjectTrack(r, project.teamId)).map(toTrack)
     })
   }
 
@@ -333,7 +368,8 @@ export class AppwriteBackend implements Backend {
         const slice = file.slice(i * UPLOAD_PART_BYTES, Math.min(file.size, (i + 1) * UPLOAD_PART_BYTES))
         const fileId = `${track.id}p${i}`
         const existing = await this.storage.getFile({ bucketId: BUCKET_ID, fileId }).catch(() => null)
-        if (existing && existing.sizeOriginal === slice.size) {
+        // Resume: a part counts as sent only if every chunk of it reached the server.
+        if (existing && existing.sizeOriginal === slice.size && existing.chunksUploaded >= existing.chunksTotal) {
           done += slice.size
           onProgress?.(done / file.size)
         } else {
@@ -358,11 +394,11 @@ export class AppwriteBackend implements Backend {
 
   downloadTrackMedia(track: Track, onProgress?: Progress): Promise<Blob> {
     return wrap(async () => {
-      const jwt = await this.token()
       const parts: Blob[] = []
       let loaded = 0
       const total = track.sizeBytes || 1
       for (const fileId of track.fileIds) {
+        const jwt = await this.token()
         const url = this.storage.getFileDownload({ bucketId: BUCKET_ID, fileId })
         const res = await fetch(url, { headers: { 'X-Appwrite-JWT': jwt, 'X-Appwrite-Project': APPWRITE_PROJECT_ID } })
         if (!res.ok || !res.body) throw new BackendError('download_failed', `Falha ao baixar o vídeo (${res.status}).`)

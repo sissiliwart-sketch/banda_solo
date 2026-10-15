@@ -35,10 +35,21 @@ export async function POST(request: Request): Promise<Response> {
     const admin = new Client().setEndpoint(ENDPOINT).setProject(PROJECT).setKey(KEY)
     const db = new TablesDB(admin)
     const res = await db.listRows({ databaseId: 'bandasolo', tableId: 'projects', queries: [Query.equal('shareCode', code), Query.limit(1)] })
-    const project = res.rows[0] as unknown as { $id: string; teamId: string } | undefined
+    const project = res.rows[0] as unknown as { $id: string; teamId: string; ownerId: string; $permissions: string[] } | undefined
     if (!project) return json(404, { error: 'Código não encontrado. Confira as letras e números.' })
 
+    // Only rows created by the team's owner count: a forged row (any account can create one with
+    // someone else's teamId) must never grant access to that team.
     const teams = new Teams(admin)
+    const perms = project.$permissions ?? []
+    const genuineRow = perms.includes(`read("team:${project.teamId}")`) && perms.includes(`delete("user:${project.ownerId}")`)
+    const owners = genuineRow
+      ? await teams.listMemberships({ teamId: project.teamId, queries: [Query.equal('userId', project.ownerId)] })
+      : { memberships: [] as { roles: string[] }[] }
+    if (!genuineRow || !owners.memberships.some((m) => m.roles.includes('owner'))) {
+      return json(404, { error: 'Código não encontrado. Confira as letras e números.' })
+    }
+
     const members = await teams.listMemberships({ teamId: project.teamId, queries: [Query.equal('userId', userId)] })
     if (members.total === 0) {
       // Created with the server key, the membership is confirmed immediately (no invitation e-mail).

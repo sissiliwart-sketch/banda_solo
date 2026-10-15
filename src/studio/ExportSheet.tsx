@@ -12,12 +12,14 @@ export function ExportSheet({
   project,
   tracks,
   blocked,
+  warning,
 }: {
   open: boolean
   onClose: () => void
   project: Project
   tracks: ExportTrack[]
   blocked: string | null
+  warning?: string | null
 }) {
   const [height, setHeight] = useState<1080 | 720>(1080)
   const [showNames, setShowNames] = useState(true)
@@ -52,6 +54,7 @@ export function ExportSheet({
     <Modal open={open} onClose={close} title="Gerar vídeo final" dismissable={progress === null}>
       <div className="space-y-4">
         {blocked ? <p className="rounded-xl border border-accent/40 bg-accent/10 p-3 text-sm text-accent">{blocked}</p> : null}
+        {!blocked && warning ? <p className="rounded-xl border border-line bg-panel-2 p-3 text-sm text-muted">{warning}</p> : null}
         <p className="text-sm text-muted">
           Junta todas as telas num vídeo só, com o som mixado do jeito que está no mixer. Duração: <b className="text-text">{formatTime(duration)}</b>. O vídeo é
           gerado aqui no tablet — pode levar alguns minutos em músicas longas.

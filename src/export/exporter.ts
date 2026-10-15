@@ -55,7 +55,7 @@ let aacRegistered: Promise<void> | null = null
  * FFmpeg's AAC encoder (WASM) instead of the device's: consistent, high quality on every phone and
  * tablet (hardware AAC encoders vary a lot and some ignore the bitrate).
  */
-function useWasmAac(): Promise<void> {
+function registerWasmAac(): Promise<void> {
   if (!aacRegistered) {
     aacRegistered = import('@mediabunny/aac-encoder').then(({ registerAacEncoder }) => registerAacEncoder())
   }
@@ -229,7 +229,7 @@ export async function exportVideo(o: ExportOptions): Promise<File> {
   const avc = await canEncodeVideo('avc', { width: W, height: H })
   const mp4 = (o.container ?? (avc ? 'mp4' : 'webm')) === 'mp4'
   const videoCodec = avc && mp4 ? 'avc' : (await canEncodeVideo('vp9', { width: W, height: H })) ? 'vp9' : 'vp8'
-  if (mp4) await useWasmAac()
+  if (mp4) await registerWasmAac()
   const audioCodec = mp4 ? 'aac' : 'opus'
   if (!mp4 && !(await canEncodeAudio('opus', { numberOfChannels: 2, sampleRate: SR }))) throw new Error('Este navegador não consegue gerar o áudio do vídeo.')
 

@@ -177,7 +177,9 @@ export async function GET(request: Request): Promise<Response> {
   if (!key) return json(500, { ok: false, error: 'APPWRITE_API_KEY não configurada na Vercel.' })
   const given = new URL(request.url).searchParams.get('token') ?? ''
   const expected = setupToken(key)
-  if (given.length !== expected.length || !timingSafeEqual(Buffer.from(given), Buffer.from(expected))) {
+  const a = Buffer.from(given)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return json(403, { ok: false, error: 'token inválido' })
   }
   const lines: string[] = []

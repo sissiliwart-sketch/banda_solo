@@ -499,11 +499,12 @@ export class StudioEngine extends Emitter<Events> {
     this.stopSources()
     if (this.take) {
       void this.take.recorder.abort()
-      void this.capture.stop()
       this.take = null
     }
     for (const id of [...this.tracks.keys()]) this.removeTrack(id)
     this.closeDevices()
+    this.metronome.stop()
+    this.capture.dispose()
     void keepScreenOn(false)
   }
 }

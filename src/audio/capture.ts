@@ -74,6 +74,16 @@ export class Capture {
     this.monitor.gain.setTargetAtTime(on ? volume : 0, this.ctx.currentTime, 0.02)
   }
 
+  /** Disconnects the worklet so a closed studio leaves nothing running on the audio thread. */
+  dispose(): void {
+    this.setStream(null)
+    this.onLevel = null
+    this.node.port.onmessage = null
+    this.node.port.close()
+    this.node.disconnect()
+    this.monitor.disconnect()
+  }
+
   get hasInput(): boolean {
     return this.source !== null
   }
