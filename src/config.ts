@@ -1,5 +1,6 @@
-export const APPWRITE_ENDPOINT: string = import.meta.env.VITE_APPWRITE_ENDPOINT ?? ''
-export const APPWRITE_PROJECT_ID: string = import.meta.env.VITE_APPWRITE_PROJECT_ID ?? ''
+// Public values (they identify the Appwrite project; access is governed by sessions + permissions).
+export const APPWRITE_ENDPOINT: string = import.meta.env.VITE_APPWRITE_ENDPOINT || 'https://nyc.cloud.appwrite.io/v1'
+export const APPWRITE_PROJECT_ID: string = import.meta.env.VITE_APPWRITE_PROJECT_ID || '6ad0293700282c1d0892'
 
 export const DB_ID = 'bandasolo'
 export const T_PROJECTS = 'projects'

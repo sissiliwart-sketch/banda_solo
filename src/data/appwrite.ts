@@ -81,6 +81,10 @@ function friendly(err: unknown): Error {
     if (/password/i.test(err.message)) return new BackendError(type, 'A senha precisa ter pelo menos 8 caracteres.')
     if (type === 'storage_file_size_exceeded' || err.code === 413) return new BackendError(type, 'Arquivo grande demais para o plano de armazenamento.')
     if (type === 'storage_bucket_limit' || /limit/i.test(type)) return new BackendError(type, 'O armazenamento da nuvem atingiu o limite do plano.')
+    if (/database_not_found|table_not_found|collection_not_found|storage_bucket_not_found/.test(type)) {
+      return new BackendError(type, 'A nuvem ainda está sendo configurada. Tente de novo em alguns minutos ou use "Testar sem conta".')
+    }
+    if (type === 'general_unauthorized_scope' || type === 'user_unauthorized') return new BackendError(type, 'Sem permissão para isso.')
     if (err.code === 401) return new BackendError('unauthorized', 'Sua sessão expirou. Entre novamente.')
     if (err.code === 404) return new BackendError('not_found', 'Não encontrado (talvez tenha sido apagado).')
     return new BackendError(type || 'error', err.message)

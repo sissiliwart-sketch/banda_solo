@@ -2,8 +2,8 @@
 // Runs on Vercel with the Appwrite server key (APPWRITE_API_KEY), which never reaches the browser.
 import { Account, Client, Query, TablesDB, Teams } from 'node-appwrite'
 
-const ENDPOINT = process.env.APPWRITE_ENDPOINT || process.env.VITE_APPWRITE_ENDPOINT || ''
-const PROJECT = process.env.APPWRITE_PROJECT_ID || process.env.VITE_APPWRITE_PROJECT_ID || ''
+const ENDPOINT = process.env.APPWRITE_ENDPOINT || process.env.VITE_APPWRITE_ENDPOINT || 'https://nyc.cloud.appwrite.io/v1'
+const PROJECT = process.env.APPWRITE_PROJECT_ID || process.env.VITE_APPWRITE_PROJECT_ID || '6ad0293700282c1d0892'
 const KEY = process.env.APPWRITE_API_KEY || ''
 
 function json(status: number, body: unknown): Response {

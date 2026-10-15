@@ -28,22 +28,12 @@ função `/api/join`).
 
 ## Configuração
 
-Variáveis de ambiente (Vercel → Project → Settings → Environment Variables):
-
-| Variável | Onde | Exemplo |
-| --- | --- | --- |
-| `VITE_APPWRITE_ENDPOINT` | build (público) | `https://nyc.cloud.appwrite.io/v1` |
-| `VITE_APPWRITE_PROJECT_ID` | build (público) | `banda-solo` |
-| `APPWRITE_API_KEY` | servidor (secreta) | chave de API do projeto Appwrite |
-
-No Appwrite: adicione as plataformas Web `*.vercel.app` e `localhost`. Para criar banco, tabelas e
-bucket:
-
-```bash
-APPWRITE_ENDPOINT=... APPWRITE_PROJECT_ID=... APPWRITE_API_KEY=... npm run setup:appwrite
-```
-
-Sem essas variáveis o app funciona no **modo local** (tudo fica só no aparelho).
+- Appwrite: projeto `6ad0293700282c1d0892` em `https://nyc.cloud.appwrite.io/v1` (valores públicos,
+  já embutidos em `src/config.ts`; podem ser trocados por `VITE_APPWRITE_ENDPOINT` /
+  `VITE_APPWRITE_PROJECT_ID`). Plataformas Web: `*.vercel.app` e `localhost`.
+- Vercel: variável secreta `APPWRITE_API_KEY` (usada só pelas funções `/api/join` e `/api/setup`).
+- Banco, tabelas e bucket: `GET /api/setup?token=…` na Vercel, ou localmente
+  `APPWRITE_API_KEY=… node scripts/setup-appwrite.mjs` (o token sai de `--token`). Idempotente.
 
 ## Scripts
 
