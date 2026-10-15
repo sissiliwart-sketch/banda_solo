@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { crossCorrelate, fft, findTemplate, makeChirp, median, resampleLinear, softClip } from './dsp'
+import { crossCorrelate, fft, findTemplate, makeChirp, median, resampleLinear } from './dsp'
 
 function rng(seed: number) {
   let s = seed >>> 0
@@ -56,11 +56,5 @@ describe('helpers', () => {
   it('resampleLinear keeps duration', () => {
     const x = new Float32Array(44100)
     expect(resampleLinear(x, 44100, 48000).length).toBe(48000)
-  })
-  it('softClip is transparent below the knee and bounded above', () => {
-    expect(softClip(0.5)).toBe(0.5)
-    expect(softClip(-0.8)).toBe(-0.8)
-    expect(softClip(3)).toBeLessThan(1)
-    expect(softClip(-3)).toBeGreaterThan(-1)
   })
 })

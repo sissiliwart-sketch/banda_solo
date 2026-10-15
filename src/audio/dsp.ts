@@ -174,24 +174,3 @@ export function median(values: number[]): number {
   const m = s.length >> 1
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
 }
-
-/** Stateless soft clipper used on the master bus (live and export) to avoid harsh digital clipping. */
-export function softClip(x: number, knee = 0.85): number {
-  const a = Math.abs(x)
-  if (a <= knee) return x
-  const room = 1 - knee
-  return Math.sign(x) * (knee + room * Math.tanh((a - knee) / room))
-}
-
-/**
- * WaveShaper curve covering input range [-range, range]. Feed the shaper with the signal
- * scaled by 1/range (WaveShaperNode maps its input domain to [-1, 1]).
- */
-export function makeSoftClipCurve(range = 2, size = 8192): Float32Array<ArrayBuffer> {
-  const curve = new Float32Array(size)
-  for (let i = 0; i < size; i++) {
-    const x = (i / (size - 1)) * 2 - 1
-    curve[i] = softClip(x * range)
-  }
-  return curve
-}

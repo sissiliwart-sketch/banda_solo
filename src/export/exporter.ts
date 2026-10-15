@@ -6,6 +6,7 @@ import {
   canEncodeVideo,
   Mp4OutputFormat,
   Output,
+  Quality,
   QUALITY_HIGH,
   StreamTarget,
   VideoSampleSink,
@@ -15,7 +16,7 @@ import {
   type VideoSample,
   type WrappedAudioBuffer,
 } from 'mediabunny'
-import { softClip } from '../audio/dsp'
+import { EXPORT_LIMITER, PeakLimiter } from '../audio/limiter'
 import { audibleTracks, fileTimeAt, songDuration, type Project, type Track } from '../data/types'
 import { openInput } from '../media/mediafile'
 import { openWritable, paths, readFile } from '../media/opfs'
@@ -33,6 +34,32 @@ export interface ExportOptions {
   showNames: boolean
   onProgress?: (fraction: number) => void
   signal?: AbortSignal
+  /** Force a container (tests). Default: MP4 when H.264 can be encoded, else WebM. */
+  container?: 'mp4' | 'webm'
+}
+
+/** Final mix: AAC 256 kbps (MP4) or Opus 256 kbps (WebM), stereo 48 kHz. */
+const AUDIO_BITRATE = 256_000
+/**
+ * FFmpeg's AAC encoder always emits 1024 priming samples. Starting the audio at −1024 samples makes
+ * the MP4 muxer write an edit list that tells players to skip them, so sound and picture line up
+ * from the first frame (Opus/WebM carries its pre-skip itself).
+ */
+const AAC_PRIMING_SAMPLES = 1024
+/** Allow up to 3 dB of transparent limiting on the loudest peak, never boost more than +9 dB. */
+const MAX_LIMITING = 10 ** (3 / 20)
+const MAX_BOOST = 10 ** (9 / 20)
+
+let aacRegistered: Promise<void> | null = null
+/**
+ * FFmpeg's AAC encoder (WASM) instead of the device's: consistent, high quality on every phone and
+ * tablet (hardware AAC encoders vary a lot and some ignore the bitrate).
+ */
+function useWasmAac(): Promise<void> {
+  if (!aacRegistered) {
+    aacRegistered = import('@mediabunny/aac-encoder').then(({ registerAacEncoder }) => registerAacEncoder())
+  }
+  return aacRegistered
 }
 
 const FPS = 30
@@ -56,7 +83,7 @@ function slug(s: string): string {
 }
 
 /** Pulls decoded audio sequentially and hands out the buffers overlapping each mix chunk. */
-class AudioReader {
+export class AudioReader {
   private it: AsyncGenerator<WrappedAudioBuffer, void, unknown> | null = null
   private carry: WrappedAudioBuffer[] = []
   private done = false
@@ -115,6 +142,57 @@ interface Lane {
   audio: AudioReader
 }
 
+/** Mixes [a, b) of the timeline with each track's volume and pan (no limiting), in stereo. */
+export async function renderMix(lanes: { track: Track; audio: AudioReader }[], audible: Set<string>, gain: number, a: number, b: number): Promise<AudioBuffer> {
+  const len = Math.max(1, Math.round((b - a) * SR))
+  const off = new OfflineAudioContext(2, len, SR)
+  for (const lane of lanes) {
+    const t = lane.track
+    const from = fileTimeAt(t, a)
+    const bufs = await lane.audio.collect(from, fileTimeAt(t, b))
+    if (!audible.has(t.id) || bufs.length === 0) continue
+    const g = off.createGain()
+    g.gain.value = t.volume * gain
+    const p = off.createStereoPanner()
+    p.pan.value = t.pan
+    g.connect(p).connect(off.destination)
+    for (const wb of bufs) {
+      const node = off.createBufferSource()
+      node.buffer = wb.buffer
+      node.connect(g)
+      // Whole-sample placement (like live playback): consecutive chunks join seamlessly.
+      const when = Math.round((wb.timestamp - from) * SR)
+      if (when < 0) node.start(0, -when / wb.buffer.sampleRate)
+      else node.start(when / SR)
+    }
+  }
+  return off.startRendering()
+}
+
+/** First pass: the true peak of the raw mix, to set the master level before limiting. */
+async function measureMixPeak(tracks: ExportTrack[], audible: Set<string>, duration: number, onProgress: (f: number) => void, signal?: AbortSignal): Promise<number> {
+  const inputs = tracks.map((et) => openInput(et.file))
+  try {
+    const lanes = tracks.map((et, i) => ({ track: et.track, audio: new AudioReader(inputs[i], fileTimeAt(et.track, 0)) }))
+    let peak = 0
+    for (let a = 0; a < duration; a += AUDIO_CHUNK * 2) {
+      if (signal?.aborted) throw new DOMException('Exportação cancelada', 'AbortError')
+      const mixed = await renderMix(lanes, audible, 1, a, Math.min(duration, a + AUDIO_CHUNK * 2))
+      for (let c = 0; c < mixed.numberOfChannels; c++) {
+        const d = mixed.getChannelData(c)
+        for (let i = 0; i < d.length; i++) {
+          const v = d[i] < 0 ? -d[i] : d[i]
+          if (v > peak) peak = v
+        }
+      }
+      onProgress(Math.min(1, (a + AUDIO_CHUNK * 2) / duration))
+    }
+    return peak
+  } finally {
+    inputs.forEach((i) => i.dispose())
+  }
+}
+
 function drawLabel(ctx: OffscreenCanvasRenderingContext2D, text: string, x: number, y: number, scale: number) {
   const fs = Math.round(24 * scale)
   ctx.font = `700 ${fs}px Inter, system-ui, sans-serif`
@@ -133,7 +211,10 @@ function drawLabel(ctx: OffscreenCanvasRenderingContext2D, text: string, x: numb
 /**
  * Renders the final split-screen video on the device: every track's video is decoded, cropped into
  * its tile and composited onto a canvas, while the audio is mixed offline with the same volume,
- * pan, mute/solo and soft-clip as live playback. Output: MP4 (H.264/AAC) when supported, else WebM.
+ * pan and mute/solo as live playback, then mastered: a first pass measures the mix peak, the level is
+ * set so the look-ahead limiter shaves at most 3 dB, and the limiter (−1.5 dBFS ceiling) guarantees
+ * the file never clips — not even after AAC/Opus encoding. Output: MP4 (H.264 + AAC 256 kbps) when
+ * H.264 can be encoded, else WebM (VP9 + Opus 256 kbps).
  */
 export async function exportVideo(o: ExportOptions): Promise<File> {
   const { project } = o
@@ -145,9 +226,25 @@ export async function exportVideo(o: ExportOptions): Promise<File> {
   const duration = songDuration(o.tracks.map((t) => t.track))
   if (duration <= 0) throw new Error('Nada gravado ainda.')
 
-  const videoCodec = (await canEncodeVideo('avc', { width: W, height: H })) ? 'avc' : (await canEncodeVideo('vp9', { width: W, height: H })) ? 'vp9' : 'vp8'
-  const mp4 = videoCodec === 'avc'
-  const audioCodec = mp4 && (await canEncodeAudio('aac', { numberOfChannels: 2, sampleRate: SR })) ? 'aac' : 'opus'
+  const avc = await canEncodeVideo('avc', { width: W, height: H })
+  const mp4 = (o.container ?? (avc ? 'mp4' : 'webm')) === 'mp4'
+  const videoCodec = avc && mp4 ? 'avc' : (await canEncodeVideo('vp9', { width: W, height: H })) ? 'vp9' : 'vp8'
+  if (mp4) await useWasmAac()
+  const audioCodec = mp4 ? 'aac' : 'opus'
+  if (!mp4 && !(await canEncodeAudio('opus', { numberOfChannels: 2, sampleRate: SR }))) throw new Error('Este navegador não consegue gerar o áudio do vídeo.')
+
+  // Pass 1 — loudness/peak analysis of the mix.
+  const audible = new Set(audibleTracks(o.tracks.map((t) => t.track)).map((t) => t.id))
+  const ANALYSIS = 0.12
+  const peak = await measureMixPeak(o.tracks, audible, duration, (f) => o.onProgress?.(f * ANALYSIS), o.signal)
+  const masterGain = peak > 1e-4 ? Math.min(MAX_BOOST, (EXPORT_LIMITER.ceiling * MAX_LIMITING) / peak) : 1
+  const limiter = new PeakLimiter({
+    ceiling: EXPORT_LIMITER.ceiling,
+    lookahead: Math.round(EXPORT_LIMITER.lookaheadSec * SR),
+    release: EXPORT_LIMITER.release,
+    sampleRate: SR,
+    channels: 2,
+  })
   const name = `${slug(project.title)}-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.${mp4 ? 'mp4' : 'webm'}`
   const writable = await openWritable(paths.export(name))
   const output = new Output({
@@ -158,7 +255,10 @@ export async function exportVideo(o: ExportOptions): Promise<File> {
   const ctx = canvas.getContext('2d', { alpha: false })
   if (!ctx) throw new Error('Canvas indisponível')
   const videoSource = new CanvasSource(canvas, { codec: videoCodec, bitrate: QUALITY_HIGH, keyFrameInterval: 2 })
-  const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: QUALITY_HIGH })
+  const audioSource = new AudioBufferSource(
+    { codec: audioCodec, quality: new Quality({ bitrate: AUDIO_BITRATE }) },
+    { startTimestamp: mp4 ? -AAC_PRIMING_SAMPLES / SR : 0 },
+  )
   output.addVideoTrack(videoSource, { frameRate: FPS })
   output.addAudioTrack(audioSource)
   await output.start()
@@ -180,41 +280,33 @@ export async function exportVideo(o: ExportOptions): Promise<File> {
     })
   }
 
-  const audible = new Set(audibleTracks(o.tracks.map((t) => t.track)).map((t) => t.id))
+  // Pass 2 — mix, master gain, limiter (its look-ahead delay is trimmed so audio stays in sync).
+  const mixLanes = [...lanes.values()].map((l) => ({ track: l.et.track, audio: l.audio }))
+  let skip = limiter.latency
+  const pushLimited = async (inp: Float32Array[], n: number) => {
+    const out = [new Float32Array(n), new Float32Array(n)]
+    limiter.process(inp, out, n)
+    const start = Math.min(skip, n)
+    skip -= start
+    if (n - start <= 0) return
+    const buf = new AudioBuffer({ length: n - start, numberOfChannels: 2, sampleRate: SR })
+    buf.copyToChannel(out[0].subarray(start), 0)
+    buf.copyToChannel(out[1].subarray(start), 1)
+    await audioSource.add(buf)
+  }
   let audioDone = 0
   const mixUntil = async (target: number) => {
     while (audioDone < target - 1e-9) {
       const a = audioDone
       const b = Math.min(duration, a + AUDIO_CHUNK)
-      const len = Math.max(1, Math.round((b - a) * SR))
-      const off = new OfflineAudioContext(2, len, SR)
-      for (const lane of lanes.values()) {
-        const t = lane.et.track
-        const from = fileTimeAt(t, a)
-        const bufs = await lane.audio.collect(from, fileTimeAt(t, b))
-        if (!audible.has(t.id) || bufs.length === 0) continue
-        const g = off.createGain()
-        g.gain.value = t.volume
-        const p = off.createStereoPanner()
-        p.pan.value = t.pan
-        g.connect(p).connect(off.destination)
-        for (const wb of bufs) {
-          const node = off.createBufferSource()
-          node.buffer = wb.buffer
-          node.connect(g)
-          const when = wb.timestamp - from
-          if (when < 0) node.start(0, -when)
-          else node.start(when)
-        }
-      }
-      const mixed = await off.startRendering()
-      for (let c = 0; c < mixed.numberOfChannels; c++) {
-        const d = mixed.getChannelData(c)
-        for (let i = 0; i < d.length; i++) d[i] = softClip(d[i])
-      }
-      await audioSource.add(mixed)
+      const mixed = await renderMix(mixLanes, audible, masterGain, a, b)
+      await pushLimited([mixed.getChannelData(0), mixed.getChannelData(1)], mixed.length)
       audioDone = b
     }
+  }
+  const flushLimiter = () => {
+    const tail = limiter.latency
+    return pushLimited([new Float32Array(tail), new Float32Array(tail)], tail)
   }
 
   const gap = Math.max(2, Math.round(8 * scale))
@@ -262,9 +354,10 @@ export async function exportVideo(o: ExportOptions): Promise<File> {
         }
       }
       await videoSource.add(t, 1 / FPS)
-      if (k % 15 === 0) o.onProgress?.(t / duration)
+      if (k % 15 === 0) o.onProgress?.(ANALYSIS + (1 - ANALYSIS) * (t / duration))
     }
     await mixUntil(duration)
+    await flushLimiter()
     videoSource.close()
     audioSource.close()
     await output.finalize()

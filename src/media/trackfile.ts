@@ -5,7 +5,7 @@ import {
   EncodedVideoPacketSource,
   Mp4OutputFormat,
   Output,
-  QUALITY_HIGH,
+  Quality,
   StreamTarget,
   WebMOutputFormat,
   type StreamTargetChunk,
@@ -53,7 +53,8 @@ export async function buildTrackFile(raw: File, capture: CaptureData, outPath: s
     })
     const videoSource = vTrack && vCodec ? new EncodedVideoPacketSource(vCodec) : null
     if (videoSource && vTrack) output.addVideoTrack(videoSource, { rotation: await vTrack.getRotation(), frameRate: 30 })
-    const audioSource = new AudioBufferSource({ codec: aCodec, bitrate: QUALITY_HIGH })
+    // 192 kbps for a mono track is transparent; the mix is re-encoded only once more on export.
+    const audioSource = new AudioBufferSource({ codec: aCodec, quality: new Quality({ bitrate: 192_000 }) })
     output.addAudioTrack(audioSource)
     await output.start()
 

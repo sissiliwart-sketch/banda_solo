@@ -13,6 +13,7 @@
     "setup:appwrite": "node scripts/setup-appwrite.mjs"
   },
   "dependencies": {
+    "@mediabunny/aac-encoder": "^1.61.4",
     "appwrite": "^28.3.0",
     "mediabunny": "^1.61.4",
     "node-appwrite": "^29.4.0",

@@ -1,5 +1,5 @@
 import workletUrl from './worklets/capture.worklet.js?url'
-import { makeSoftClipCurve } from './dsp'
+import limiterUrl from './worklets/limiter.worklet.ts?worker&url'
 
 export const SAMPLE_RATE = 48000
 
@@ -7,6 +7,7 @@ let ctx: AudioContext | null = null
 let workletLoaded: Promise<void> | null = null
 let masterIn: GainNode | null = null
 let outputBus: GainNode | null = null
+let limiterReady = false
 
 export function getAudioContext(): AudioContext {
   if (!ctx) {
@@ -22,7 +23,17 @@ export function getAudioContext(): AudioContext {
 /** Creates the context and loads the capture worklet (works before any user gesture). */
 export async function ensureAudio(): Promise<AudioContext> {
   const c = getAudioContext()
-  if (!workletLoaded) workletLoaded = c.audioWorklet.addModule(workletUrl)
+  if (!workletLoaded) {
+    workletLoaded = Promise.all([
+      c.audioWorklet.addModule(workletUrl),
+      c.audioWorklet.addModule(limiterUrl).then(
+        () => {
+          limiterReady = true
+        },
+        (err) => console.warn('[audio] limiter unavailable', err),
+      ),
+    ]).then(() => undefined)
+  }
   await workletLoaded
   return c
 }
@@ -33,12 +44,28 @@ export async function resumeAudio(): Promise<void> {
   if (c.state !== 'running') await c.resume()
 }
 
-/** Final output: everything audible (mix, metronome, calibration beeps) ends here. */
+/**
+ * Final output: everything audible (mix, metronome, calibration beeps) ends here and goes through
+ * the look-ahead limiter, so loud mixes never clip. Because calibration beeps take the same path,
+ * the limiter's 5 ms latency is part of the measured round trip and sync stays exact.
+ */
 export function getOutputBus(): GainNode {
   const c = getAudioContext()
   if (!outputBus) {
     outputBus = c.createGain()
-    outputBus.connect(c.destination)
+    if (limiterReady) {
+      const limiter = new AudioWorkletNode(c, 'banda-solo-limiter', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+        channelCount: 2,
+        channelCountMode: 'explicit',
+        channelInterpretation: 'speakers',
+      })
+      outputBus.connect(limiter).connect(c.destination)
+    } else {
+      outputBus.connect(c.destination)
+    }
   }
   return outputBus
 }
@@ -54,20 +81,12 @@ export function loopbackAudioTrack(): MediaStreamTrack {
   return dest.stream.getAudioTracks()[0]
 }
 
-/**
- * Master bus: everything audible goes through here. A stateless soft clipper keeps the mix
- * of up to eight tracks from clipping harshly (the export applies the same curve).
- */
+/** Mix bus for all tracks (unity gain; peaks are handled by the limiter on the output bus). */
 export function getMasterInput(): GainNode {
   const c = getAudioContext()
   if (!masterIn) {
     masterIn = c.createGain()
-    const pre = c.createGain()
-    pre.gain.value = 0.5
-    const shaper = c.createWaveShaper()
-    shaper.curve = makeSoftClipCurve(2)
-    shaper.oversample = 'none'
-    masterIn.connect(pre).connect(shaper).connect(getOutputBus())
+    masterIn.connect(getOutputBus())
   }
   return masterIn
 }
