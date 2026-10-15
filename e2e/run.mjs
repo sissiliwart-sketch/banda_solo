@@ -211,8 +211,9 @@ try {
     if (Math.abs(res.offsetMs) > 1) throw new Error(`desalinhamento de ${res.offsetMs.toFixed(2)} ms`)
   })
 
-  await step('"Regravar" começa uma nova gravação na mesma tela', async () => {
-    await page.getByRole('button', { name: 'Gravar tela 3' }).click()
+  await step('"Regravar" começa uma nova gravação na mesma tela (com toque duplo em Gravar)', async () => {
+    // A double tap must start exactly one recording.
+    await page.getByRole('button', { name: 'Gravar tela 3' }).dblclick()
     await page.getByRole('button', { name: 'Parar gravação' }).waitFor()
     await sleep(5000)
     await page.getByRole('button', { name: 'Parar gravação' }).click()
@@ -224,6 +225,8 @@ try {
     await page.getByRole('heading', { name: 'Gravação da tela 3' }).waitFor({ timeout: 30000 })
     await page.getByRole('button', { name: 'Descartar' }).click()
     await page.getByRole('heading', { name: 'Gravação da tela 3' }).waitFor({ state: 'detached' })
+    const st = await page.evaluate(() => ({ state: window.__bandaSoloEngine.state, starting: window.__bandaSoloEngine.isStarting }))
+    if (st.state !== 'idle' || st.starting) throw new Error(`motor não ficou parado: ${JSON.stringify(st)}`)
   })
 
   await step('tocar as duas telas juntas', async () => {

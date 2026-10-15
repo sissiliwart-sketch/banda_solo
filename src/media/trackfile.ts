@@ -52,7 +52,8 @@ export async function buildTrackFile(raw: File, capture: CaptureData, outPath: s
       target: new StreamTarget(writable as unknown as WritableStream<StreamTargetChunk>, { chunked: true, chunkSize: 4 * 1024 * 1024 }),
     })
     const videoSource = vTrack && vCodec ? new EncodedVideoPacketSource(vCodec) : null
-    if (videoSource && vTrack) output.addVideoTrack(videoSource, { rotation: await vTrack.getRotation(), frameRate: 30 })
+    // No frameRate hint: it would snap the precisely shifted timestamps to a 33 ms grid.
+    if (videoSource && vTrack) output.addVideoTrack(videoSource, { rotation: await vTrack.getRotation() })
     // 192 kbps for a mono track is transparent; the mix is re-encoded only once more on export.
     const audioSource = new AudioBufferSource({ codec: aCodec, quality: new Quality({ bitrate: 192_000 }) })
     output.addAudioTrack(audioSource)

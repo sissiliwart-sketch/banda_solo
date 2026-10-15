@@ -19,7 +19,7 @@ import {
 import { EXPORT_LIMITER, PeakLimiter } from '../audio/limiter'
 import { audibleTracks, fileTimeAt, songDuration, type Project, type Track } from '../data/types'
 import { openInput } from '../media/mediafile'
-import { openWritable, paths, readFile } from '../media/opfs'
+import { clearDir, openWritable, paths, readFile, removeEntry } from '../media/opfs'
 import { ASPECTS, coverCrop, getLayout } from '../studio/layouts'
 
 export interface ExportTrack {
@@ -162,7 +162,7 @@ export async function renderMix(lanes: { track: Track; audio: AudioReader }[], a
       node.connect(g)
       // Whole-sample placement (like live playback): consecutive chunks join seamlessly.
       const when = Math.round((wb.timestamp - from) * SR)
-      if (when < 0) node.start(0, -when / wb.buffer.sampleRate)
+      if (when < 0) node.start(0, -when / SR)
       else node.start(when / SR)
     }
   }
@@ -246,6 +246,8 @@ export async function exportVideo(o: ExportOptions): Promise<File> {
     channels: 2,
   })
   const name = `${slug(project.title)}-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.${mp4 ? 'mp4' : 'webm'}`
+  // Keep only the latest export on the device (each one can be hundreds of MB).
+  await clearDir('exports')
   const writable = await openWritable(paths.export(name))
   const output = new Output({
     format: mp4 ? new Mp4OutputFormat({ fastStart: false }) : new WebMOutputFormat(),
@@ -363,6 +365,8 @@ export async function exportVideo(o: ExportOptions): Promise<File> {
     await output.finalize()
   } catch (err) {
     await output.cancel().catch(() => undefined)
+    // A cancelled/failed export would leave an unplayable partial file behind.
+    await removeEntry(paths.export(name))
     throw err
   } finally {
     for (const lane of lanes.values()) {

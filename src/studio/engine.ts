@@ -106,6 +106,12 @@ export class StudioEngine extends Emitter<Events> {
   private quality: DeviceSelection['quality'] = '720p'
   private disposed = false
   private excluded = new Set<string>()
+  /** A play/record start in progress; starts are serialized and stop() waits for them. */
+  private starting: Promise<void> | null = null
+
+  get isStarting(): boolean {
+    return this.starting !== null
+  }
 
   private constructor(ctx: AudioContext) {
     super()
@@ -371,14 +377,28 @@ export class StudioEngine extends Emitter<Events> {
     }
   }
 
-  async play(from = 0): Promise<void> {
-    if (this._state !== 'idle') await this.stop()
-    if (this.ctx.state !== 'running') await this.ctx.resume()
-    this.excluded.clear()
-    if (this.tracks.size === 0) return
-    const start = Math.max(0, Math.min(from, Math.max(0, this.duration - 0.1)))
-    this.setState('playing')
-    await this.startSources(start, 0.2)
+  /** Runs a transport start exclusively: a second tap while one is starting is ignored. */
+  private async exclusiveStart(fn: () => Promise<void>): Promise<void> {
+    if (this.starting) return
+    const run = fn()
+    this.starting = run
+    try {
+      await run
+    } finally {
+      this.starting = null
+    }
+  }
+
+  play(from = 0): Promise<void> {
+    return this.exclusiveStart(async () => {
+      if (this._state !== 'idle') await this.stopNow()
+      if (this.ctx.state !== 'running') await this.ctx.resume()
+      this.excluded.clear()
+      if (this.tracks.size === 0) return
+      const start = Math.max(0, Math.min(from, Math.max(0, this.duration - 0.1)))
+      this.setState('playing')
+      await this.startSources(start, 0.2)
+    })
   }
 
   seekIdle(pos: number): void {
@@ -390,22 +410,43 @@ export class StudioEngine extends Emitter<Events> {
     }
   }
 
-  async record(o: RecordOptions): Promise<void> {
-    if (!this.stream) throw new Error('Abra a câmera e o microfone antes de gravar.')
-    if (this._state !== 'idle') await this.stop()
+  record(o: RecordOptions): Promise<void> {
+    return this.exclusiveStart(() => this.startRecording(o))
+  }
+
+  private async startRecording(o: RecordOptions): Promise<void> {
+    const stream = this.stream
+    if (!stream) throw new Error('Abra a câmera e o microfone antes de gravar.')
+    if (this._state !== 'idle') await this.stopNow()
     if (this.ctx.state !== 'running') await this.ctx.resume()
     const takeId = uid()
     this.excluded = new Set(o.exclude ?? [])
     for (const id of this.excluded) this.tracks.get(id)?.video.pause()
-    const recorder = await TakeRecorder.create(this.stream, paths.take(takeId), this.quality)
-    await this.capture.start(120, 30, paths.takePcm(takeId))
-    await recorder.start(this.ctx)
-    const { rtl, calibrated } = effectiveRtlSec(this.ctx, this.micKey)
-    const spb = 60 / o.bpm
-    const countIn = o.countInBeats * spb
-    this.setState('countin')
-    await this.startSources(0, 0.35 + countIn)
-    this.take = { takeId, slot: o.slot, recorder, rtl, calibrated, t0: this.t0, frontCamera: isFrontFacing(this.stream) }
+    let recorder: TakeRecorder | null = null
+    let captureStarted = false
+    let rtl = 0
+    let calibrated = false
+    try {
+      recorder = await TakeRecorder.create(stream, paths.take(takeId), this.quality)
+      await this.capture.start(120, 30, paths.takePcm(takeId))
+      captureStarted = true
+      await recorder.start(this.ctx)
+      ;({ rtl, calibrated } = effectiveRtlSec(this.ctx, this.micKey))
+      this.setState('countin')
+      await this.startSources(0, 0.35 + o.countInBeats * (60 / o.bpm))
+    } catch (err) {
+      // Never leave a recorder or the PCM capture running after a failed start.
+      this.stopSources()
+      if (captureStarted) await this.capture.stop().catch(() => undefined)
+      await recorder?.abort()
+      await removeEntry(paths.take(takeId))
+      await removeEntry(paths.takePcm(takeId))
+      this.excluded.clear()
+      this.setState('idle')
+      throw err
+    }
+    const countIn = o.countInBeats * (60 / o.bpm)
+    this.take = { takeId, slot: o.slot, recorder, rtl, calibrated, t0: this.t0, frontCamera: isFrontFacing(stream) }
     if (o.countInBeats > 0 || o.metronome) {
       this.metronome.start({
         t0: this.t0,
@@ -420,6 +461,12 @@ export class StudioEngine extends Emitter<Events> {
 
   /** Stops playback or recording. Resolves with the processed take when a recording was running. */
   async stop(): Promise<TakeResult | null> {
+    // A stop tapped while play/record is still starting acts on the started transport.
+    if (this.starting) await this.starting.catch(() => undefined)
+    return this.stopNow()
+  }
+
+  private async stopNow(): Promise<TakeResult | null> {
     const take = this.take
     const pos = this.position()
     this.stopSources()
