@@ -284,6 +284,29 @@ try {
     await shot('11-projetos')
   })
 
+  await step('excluir a música apaga projeto e gravações', async () => {
+    const countTracks = () =>
+      page.evaluate(async () => {
+        const root = await navigator.storage.getDirectory()
+        const dir = await root.getDirectoryHandle('tracks').catch(() => null)
+        let n = 0
+        if (dir) for await (const _ of dir.keys()) n++
+        return { files: n, rows: JSON.parse(localStorage.getItem('bs.local.tracks') || '[]').length }
+      })
+    const before = await countTracks()
+    if (before.files === 0 || before.rows === 0) throw new Error(`nada para apagar: ${JSON.stringify(before)}`)
+    await page.getByRole('button', { name: 'Excluir Teste E2E' }).click()
+    await page.getByRole('heading', { name: 'Excluir música?' }).waitFor()
+    await shot('11b-excluir')
+    await page.getByRole('dialog').getByRole('button', { name: 'Excluir' }).click()
+    await page.getByText('Nenhuma música ainda').waitFor()
+    const after = await countTracks()
+    console.log('   antes:', JSON.stringify(before), 'depois:', JSON.stringify(after))
+    if (after.files !== 0 || after.rows !== 0) throw new Error('gravações ficaram para trás')
+    await page.reload()
+    await page.getByText('Nenhuma música ainda').waitFor()
+  })
+
   await step('página de diagnóstico', async () => {
     await page.goto(`${BASE}/diagnostico`)
     await page.getByText('Câmeras encontradas').waitFor()

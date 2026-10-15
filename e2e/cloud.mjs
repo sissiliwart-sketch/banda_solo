@@ -261,6 +261,37 @@ try {
     console.log('   faixas:', JSON.stringify(summary))
     if (tr.rows.length !== 2 || tr.rows.some((r) => r.status !== 'ready')) throw new Error('faixas incompletas no servidor')
   })
+
+  await step('B (convidado) não vê o botão de excluir', B, async () => {
+    await B.goto(`${BASE}/`)
+    await B.getByText(`Nuvem ${stamp}`).waitFor({ timeout: 20000 })
+    if (await B.getByRole('button', { name: `Excluir Nuvem ${stamp}` }).count()) throw new Error('convidado pode excluir a música do dono')
+  })
+
+  await step('A exclui a música: projeto, faixas, arquivos e time somem do servidor', A, async () => {
+    const proj = await db.getRow({ databaseId: 'bandasolo', tableId: 'projects', rowId: projectId })
+    const before = await db.listRows({ databaseId: 'bandasolo', tableId: 'tracks', queries: [Query.equal('projectId', projectId), Query.notEqual('musicianName', 'INVASOR')] })
+    const fileIds = before.rows.flatMap((r) => r.fileIds)
+    await A.goto(`${BASE}/`)
+    await A.getByRole('button', { name: `Excluir Nuvem ${stamp}` }).click()
+    await A.getByRole('dialog').getByRole('button', { name: 'Excluir' }).click()
+    await A.getByText(`"Nuvem ${stamp}" foi excluída.`).waitFor({ timeout: 60000 })
+    if (await A.getByText(`Nuvem ${stamp}`, { exact: true }).count()) throw new Error('a música continua na lista')
+    await A.screenshot({ path: `${OUT}cloud-05-excluida.png` })
+
+    const gone = (p) => p.then(() => false, (e) => e?.code === 404)
+    if (!(await gone(db.getRow({ databaseId: 'bandasolo', tableId: 'projects', rowId: projectId })))) throw new Error('projeto ficou no servidor')
+    const after = await db.listRows({ databaseId: 'bandasolo', tableId: 'tracks', queries: [Query.equal('projectId', projectId), Query.notEqual('musicianName', 'INVASOR')] })
+    if (after.total !== 0) throw new Error(`${after.total} faixa(s) ficaram no servidor`)
+    for (const f of fileIds) if (!(await gone(storage.getFile({ bucketId: 'media', fileId: f })))) throw new Error(`arquivo ${f} ficou no servidor`)
+    if (!(await gone(teams.get({ teamId: proj.teamId })))) throw new Error('time ficou no servidor')
+    console.log(`   apagados: projeto, ${before.total} faixas (inclusive a de B), ${fileIds.length} arquivos e o time`)
+
+    await B.reload()
+    await B.getByRole('button', { name: 'Nova música' }).waitFor()
+    await B.waitForTimeout(1500)
+    if (await B.getByText(`Nuvem ${stamp}`).count()) throw new Error('B ainda vê a música excluída')
+  })
 } catch {
   exitCode = 1
 } finally {

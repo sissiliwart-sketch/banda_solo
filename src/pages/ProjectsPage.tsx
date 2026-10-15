@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
-import { IconLogout, IconPlus, IconPulse, IconUsers, Logo } from '../components/icons'
-import { Button, IconButton, Spinner, toast } from '../components/ui'
+import { IconLogout, IconPlus, IconPulse, IconTrash, IconUsers, Logo } from '../components/icons'
+import { Button, IconButton, Modal, Spinner, toast } from '../components/ui'
+import { dropTrackFile } from '../data/mediaCache'
 import { useApp } from '../data/store'
 import type { Project } from '../data/types'
 import { ASPECTS, getLayout } from '../studio/layouts'
@@ -21,6 +22,8 @@ export default function ProjectsPage() {
   const { backend, user, signOut, mode } = useApp()
   const nav = useNavigate()
   const [projects, setProjects] = useState<Project[] | null>(null)
+  const [toDelete, setToDelete] = useState<Project | null>(null)
+  const [deleting, setDeleting] = useState(false)
 
   useEffect(() => {
     let alive = true
@@ -35,6 +38,25 @@ export default function ProjectsPage() {
       alive = false
     }
   }, [backend])
+
+  const confirmDelete = async () => {
+    const p = toDelete
+    if (!p) return
+    setDeleting(true)
+    try {
+      const tracks = await backend.listTracks(p)
+      await backend.deleteProject(p)
+      // Free the copies kept on this device too.
+      await Promise.all(tracks.map((t) => dropTrackFile(t.id).catch(() => undefined)))
+      setProjects((list) => list?.filter((x) => x.id !== p.id) ?? list)
+      setToDelete(null)
+      toast.ok(`"${p.title}" foi excluída.`)
+    } catch (err) {
+      toast.error(errorMessage(err))
+    } finally {
+      setDeleting(false)
+    }
+  }
 
   return (
     <div className="mx-auto max-w-5xl px-4 pb-16 pt-3">
@@ -88,8 +110,8 @@ export default function ProjectsPage() {
       ) : (
         <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => (
-            <li key={p.id}>
-              <button onClick={() => nav(`/p/${p.id}`)} className="flex w-full items-center gap-3 rounded-2xl border border-line bg-panel p-3 text-left transition hover:border-faint">
+            <li key={p.id} className="relative">
+              <button onClick={() => nav(`/p/${p.id}`)} className={`flex w-full items-center gap-3 rounded-2xl border border-line bg-panel p-3 text-left transition hover:border-faint ${p.ownerId === user?.id ? 'pr-14' : ''}`}>
                 <div className="pointer-events-none">
                   <LayoutThumb layout={getLayout(p.layoutId, p.slots, p.aspect)} aspect={p.aspect} height={64} />
                 </div>
@@ -104,10 +126,30 @@ export default function ProjectsPage() {
                   </p>
                 </div>
               </button>
+              {p.ownerId === user?.id ? (
+                <IconButton label={`Excluir ${p.title}`} onClick={() => setToDelete(p)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted hover:text-rec">
+                  <IconTrash />
+                </IconButton>
+              ) : null}
             </li>
           ))}
         </ul>
       )}
+
+      <Modal open={toDelete !== null} onClose={() => !deleting && setToDelete(null)} dismissable={!deleting} title="Excluir música?">
+        <p className="text-[15px]">
+          <b>{toDelete?.title}</b> e todas as gravações dela serão apagadas para sempre, inclusive as de quem gravou junto com você.
+        </p>
+        <p className="mt-2 text-sm text-muted">Isso não pode ser desfeito. Se quiser guardar o resultado, exporte o vídeo antes.</p>
+        <div className="mt-5 grid gap-2 sm:grid-cols-2">
+          <Button onClick={() => setToDelete(null)} disabled={deleting}>
+            Cancelar
+          </Button>
+          <Button variant="rec" onClick={confirmDelete} loading={deleting}>
+            <IconTrash /> Excluir
+          </Button>
+        </div>
+      </Modal>
     </div>
   )
 }
